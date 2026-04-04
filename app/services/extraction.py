@@ -65,6 +65,35 @@ Rules for pattern_tags:
   examples: family, money, trust, resilience, career, love, loss, identity"""
 
 
+FINGERPRINT_PROMPT = """You are analyzing HOW a person communicates — not WHAT they said.
+Look only at the writing style, rhythm, voice, and energy of the raw text.
+Ignore the content entirely. Focus on the delivery.
+
+You must return ONLY valid JSON. No explanation. No markdown. Just JSON.
+
+Return this exact structure:
+{{
+  "sentence_rhythm": "One sentence describing their sentence length and rhythm pattern",
+  "directness": "One sentence — do they jump straight in, or build up slowly?",
+  "humor_style": "One sentence — how do they use humor, if at all?",
+  "trailing_style": "One sentence — how do they end thoughts? Firm, trailing off, abrupt?",
+  "code_mix_words": ["list", "of", "foreign", "loanwords", "they", "use", "naturally"],
+  "filler_patterns": ["list", "of", "filler", "words", "or", "particles", "they", "repeat"],
+  "emotional_expression": "One sentence — direct about feelings or wraps them in indirection?",
+  "energy_level": "One sentence — calm/intense/fluctuating? What signals this?",
+  "sentence_starters": "One sentence — how do they typically open a sentence or thought?"
+}}
+
+Rules:
+- code_mix_words: only words from a different language than the primary text
+  e.g. English words inside Burmese text: ["lol", "okay", "honestly", "actually"]
+  e.g. Burmese words inside English text: ["ဟာ", "ပြီး"]
+- filler_patterns: words/particles that appear repeatedly and signal rhythm
+- If a field is genuinely not observable from this short text, write "not enough data"
+- Be SPECIFIC — not generic. "writes short punchy sentences" not "communicates clearly"
+- Max 15 words per string value"""
+
+
 async def extract_memory(
     text: str,
     language: str = "en",
@@ -85,7 +114,7 @@ Extract the felt memory. Preserve original voice exactly. Return only JSON."""
         try:
             response = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=2000,
+                max_tokens=6000,
                 system=EXTRACTION_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}]
             )
@@ -114,6 +143,171 @@ Extract the felt memory. Preserve original voice exactly. Return only JSON."""
     raw = raw.strip()
 
     return json.loads(raw)
+
+
+async def extract_voice_fingerprint(
+    text: str,
+    language: str = "en",
+) -> dict | None:
+    """
+    Extract voice fingerprint from raw training text.
+    Analyzes HOW the person communicates — rhythm, energy, filler words,
+    code-mixing, humor style, directness.
+
+    Returns None if text is too short to analyze meaningfully.
+    Called alongside extract_memory() in training.py — runs in parallel.
+
+    Uses Haiku — cheap and fast. Fingerprint extraction doesn't need deep reasoning.
+    """
+    if not text or len(text.strip()) < 30:
+        return None
+
+    import random
+    user_prompt = f"""Primary language of writer: {language}
+
+Raw text to analyze (focus on HOW they write, not WHAT they say):
+{text[:1500]}
+
+Return only JSON."""
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = await client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=600,
+                system=FINGERPRINT_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+            raw = response.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+            return json.loads(raw)
+
+        except (InternalServerError, APIStatusError) as e:
+            status = getattr(e, "status_code", None)
+            err_str = str(e).lower()
+            if status in (429, 529) or "overload" in err_str:
+                last_error = e
+                await asyncio.sleep((2 ** attempt) + random.uniform(0, 0.3))
+                continue
+            # Non-retryable error — don't crash training, just skip fingerprint
+            return None
+        except Exception:
+            # Never crash training over a fingerprint failure
+            return None
+
+    return None
+
+
+def merge_voice_fingerprints(
+    existing: dict | None,
+    new: dict | None,
+) -> dict | None:
+    """
+    Merge a new fingerprint reading into the accumulated fingerprint.
+
+    Strategy:
+    - String fields: keep existing if new says "not enough data", else update
+      with a rolling blend — recent sessions have more weight than old ones
+    - List fields (code_mix_words, filler_patterns): union, dedup, keep most common
+    - sample_count: increment
+
+    This is intentionally simple — no ML, just accumulation.
+    The more sessions contribute, the more stable and accurate the fingerprint.
+    """
+    if not new:
+        return existing
+    if not existing:
+        result = dict(new)
+        result["sample_count"] = 1
+        return result
+
+    merged = dict(existing)
+    sample_count = existing.get("sample_count", 1) + 1
+    merged["sample_count"] = sample_count
+
+    # String fields — update if new has real data
+    string_fields = [
+        "sentence_rhythm", "directness", "humor_style", "trailing_style",
+        "emotional_expression", "energy_level", "sentence_starters",
+    ]
+    for field in string_fields:
+        new_val = new.get(field, "")
+        if new_val and new_val != "not enough data":
+            existing_val = existing.get(field, "")
+            if not existing_val or existing_val == "not enough data":
+                # First real data for this field — take it
+                merged[field] = new_val
+            else:
+                # Both have data — keep existing (stable base) unless
+                # we've only seen 1-2 sessions, in which case update freely
+                if sample_count <= 3:
+                    merged[field] = new_val
+                # After 3+ sessions, the existing fingerprint is stable enough
+                # to keep. Occasional new readings won't override it.
+
+    # List fields — union with dedup, capped at 15 items
+    for field in ["code_mix_words", "filler_patterns"]:
+        existing_list = existing.get(field) or []
+        new_list = new.get(field) or []
+        combined = list(dict.fromkeys(existing_list + new_list))  # dedup, preserve order
+        merged[field] = combined[:15]
+
+    return merged
+
+
+def format_voice_fingerprint_for_prompt(fingerprint: dict | None) -> str:
+    """
+    Format the accumulated voice fingerprint into a concrete prompt block
+    for agent.py Layer 1.
+
+    Returns empty string if no fingerprint — transparent no-op.
+    Returns concrete style instructions, not vague descriptions.
+    """
+    if not fingerprint:
+        return ""
+
+    sample_count = fingerprint.get("sample_count", 0)
+    if sample_count < 2:
+        # Only one training session — not enough signal yet
+        # Don't inject anything that might mislead the agent
+        return ""
+
+    lines = ["HOW THIS PERSON WRITES — match this exactly:"]
+
+    fields = [
+        ("sentence_rhythm",      "Sentence rhythm"),
+        ("directness",           "Directness"),
+        ("humor_style",          "Humor"),
+        ("trailing_style",       "How they end thoughts"),
+        ("emotional_expression", "Emotional expression"),
+        ("energy_level",         "Energy"),
+        ("sentence_starters",    "How they start sentences"),
+    ]
+
+    for key, label in fields:
+        val = fingerprint.get(key, "")
+        if val and val != "not enough data":
+            lines.append(f"  {label}: {val}")
+
+    code_mix = fingerprint.get("code_mix_words") or []
+    if code_mix:
+        lines.append(f"  Code-mix words they use naturally: {', '.join(code_mix[:8])}")
+
+    fillers = fingerprint.get("filler_patterns") or []
+    if fillers:
+        lines.append(f"  Filler/rhythm words: {', '.join(fillers[:8])}")
+
+    lines.append(
+        f"\n  (Built from {sample_count} training sessions — "
+        f"this is how they actually write, not how they should write)"
+    )
+
+    return "\n".join(lines)
 
 
 async def generate_acknowledgment(

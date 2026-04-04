@@ -13,7 +13,9 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     HUME_API_KEY: str = ""
     ELEVENLABS_API_KEY: str = ""
+    VOICE_STORAGE_PATH: str = "voice_storage" 
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+    VOICE_ENABLED: str = "false"
 
     class Config:
         env_file = ".env"

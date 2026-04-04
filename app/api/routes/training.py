@@ -4,16 +4,22 @@ from sqlalchemy import select, func, text
 from pydantic import BaseModel
 from typing import Optional
 import uuid
+import asyncio
 from datetime import datetime
 
 from app.db.session import get_db
-from app.models.user import User, AgentProfile, Memory, TrainingSession, AgentResponse, StyleProfile, AgentLifecycle
+from app.models.user import User, AgentProfile, Memory, TrainingSession, StyleProfile, AgentLifecycle
 from app.core.security import get_current_user
 from app.services.embeddings import generate_embedding
 from app.services.patterns import should_run_abstraction, run_pattern_abstraction
-from app.services.extraction import extract_memory, generate_acknowledgment, check_duplicate_memory, reinforce_memory
+from app.services.extraction import (
+    extract_memory, check_duplicate_memory, reinforce_memory,
+    extract_voice_fingerprint, merge_voice_fingerprints,
+)
 
 router = APIRouter()
+
+WISDOM_CAP = 100.0
 
 
 class TrainRequest(BaseModel):
@@ -66,13 +72,28 @@ async def submit_training(
     await db.flush()
 
     try:
-        extracted = await extract_memory(
-            text=data.text,
-            language=current_user.language,
-            style_context=style_context,
+        extracted, fingerprint = await asyncio.gather(
+            extract_memory(
+                text=data.text,
+                language=current_user.language,
+                style_context=style_context,
+            ),
+            extract_voice_fingerprint(
+                text=data.text,
+                language=current_user.language,
+            ),
+            return_exceptions=False,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+    if fingerprint and style:
+        existing_fp = style.voice_fingerprint or {}
+        style.voice_fingerprint = merge_voice_fingerprints(existing_fp, fingerprint)
+        style.last_trained_at = datetime.utcnow()
+        print(f"[FINGERPRINT] merged. sample_count={style.voice_fingerprint.get('sample_count', 1)}")
+
+    await db.commit()
 
     return {
         "session_id": str(session.id),
@@ -100,8 +121,6 @@ async def confirm_memory(
         f"{data.extracted.get('instinct_formed', '')}"
     )
     embedding = await generate_embedding(embed_text)
-
-    # ← FIX: was str(embedding) which can produce scientific notation on small floats
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
     duplicate = await check_duplicate_memory(
@@ -115,12 +134,19 @@ async def confirm_memory(
             memory_id=duplicate["memory_id"],
             db=db,
         )
+
+        # Reinforce gives a small wisdom bump — it's a repeat, not new knowledge
+        agent.wisdom_score    = min(WISDOM_CAP, (agent.wisdom_score or 0.0) + 0.2)
+        agent.last_updated_at = datetime.utcnow()
+        await db.commit()
+
         return {
-            "duplicate": True,
-            "message": "You have shared something similar before. Memory reinforced.",
-            "existing_memory": duplicate["what_happened"],
-            "new_weight": reinforced["feeling_weight"],
+            "duplicate":          True,
+            "message":            "You have shared something similar before. Memory reinforced.",
+            "existing_memory":    duplicate["what_happened"],
+            "new_weight":         reinforced["feeling_weight"],
             "reinforcement_count": reinforced["reinforcement_count"],
+            "wisdom_score":       round(agent.wisdom_score, 2),
         }
 
     memory = Memory(
@@ -148,18 +174,21 @@ async def confirm_memory(
         feeling_weight=data.feeling_weight,
         never_forget=data.feeling_weight >= 8.5,
         pattern_tags=data.extracted.get("pattern_tags", []),
-        training_mode="free",
+        training_mode="manual",
     )
     db.add(memory)
     await db.flush()
 
-    # Correct embedding string format — consistent with feedback.py and extraction.py
     await db.execute(
         text("UPDATE memories SET embedding = :embedding WHERE id = :id"),
         {"embedding": embedding_str, "id": str(memory.id)}
     )
 
-    agent.total_memories = (agent.total_memories or 0) + 1
+    # New memory: wisdom += feeling_weight * 0.1
+    # Weight-5 → +0.5, weight-9 → +0.9. At 50 memories avg weight-7 → ~35 pts.
+    increment             = round(data.feeling_weight * 0.1, 3)
+    agent.wisdom_score    = min(WISDOM_CAP, (agent.wisdom_score or 0.0) + increment)
+    agent.total_memories  = (agent.total_memories or 0) + 1
     agent.last_updated_at = datetime.utcnow()
 
     result = await db.execute(
@@ -167,39 +196,21 @@ async def confirm_memory(
     )
     session = result.scalar_one_or_none()
     if session:
-        session.memories_captured = 1
+        session.memories_captured     = 1
         session.avg_weight_of_session = data.feeling_weight
 
-    # Increment lifecycle training session count
     result = await db.execute(
         select(AgentLifecycle).where(AgentLifecycle.agent_id == agent.id)
     )
     lifecycle = result.scalar_one_or_none()
     if lifecycle:
         lifecycle.training_session_count = (lifecycle.training_session_count or 0) + 1
-        lifecycle.last_active_at = datetime.utcnow()
+        lifecycle.last_active_at         = datetime.utcnow()
 
-    await db.flush()
-
-    try:
-        acknowledgment = await generate_acknowledgment(
-            memory=data.extracted,
-            user_name=current_user.name,
-            language=current_user.language,
-        )
-    except RuntimeError as e:
-        acknowledgment = "Memory saved."  # fallback if overloaded
-
-    response = AgentResponse(
-        user_id=current_user.id,
-        agent_id=agent.id,
-        memory_id=memory.id,
-        response_text=acknowledgment,
-        response_type="acknowledgment",
-    )
-    db.add(response)
     await db.commit()
 
+    # Pattern abstraction runs every 10 sessions and blends in avg pattern weight —
+    # compounds naturally on top of the per-memory increments above.
     try:
         if await should_run_abstraction(str(agent.id), db):
             await run_pattern_abstraction(str(agent.id), db)
@@ -207,12 +218,13 @@ async def confirm_memory(
         pass
 
     return {
-        "memory_id": str(memory.id),
+        "memory_id":      str(memory.id),
         "feeling_weight": data.feeling_weight,
-        "never_forget": memory.never_forget,
-        "acknowledgment": acknowledgment,
-        "pattern_tags": memory.pattern_tags,
-        "section": memory.section,
+        "never_forget":   memory.never_forget,
+        "acknowledgment": "Saved successfully.",
+        "pattern_tags":   memory.pattern_tags,
+        "section":        memory.section,
+        "wisdom_score":   round(agent.wisdom_score, 2),
     }
 
 
@@ -243,8 +255,8 @@ async def training_progress(
     total = sum(section_counts.values())
 
     return {
-        "sections": section_counts,
-        "total_memories": total,
-        "wisdom_score": agent.wisdom_score,
+        "sections":           section_counts,
+        "total_memories":     total,
+        "wisdom_score":       round(agent.wisdom_score or 0.0, 2),
         "estimated_accuracy": min(40 + (total * 2), 95),
     }

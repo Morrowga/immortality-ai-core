@@ -1,36 +1,39 @@
 import json
+import uuid
+from sqlalchemy import text as sa_text
 from anthropic import AsyncAnthropic
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from app.core.config import settings
 from app.models.user import Memory, PatternAbstraction, AgentProfile, AgentLifecycle
+from app.services.embeddings import generate_embedding
 
 client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
 async def should_run_abstraction(agent_id: str, db: AsyncSession) -> bool:
-    """Check if enough sessions have passed to run pattern abstraction."""
     result = await db.execute(
-        select(AgentLifecycle).where(
-            AgentLifecycle.agent_id == agent_id
-        )
+        select(AgentLifecycle).where(AgentLifecycle.agent_id == agent_id)
     )
     lifecycle = result.scalar_one_or_none()
     if not lifecycle:
         return False
-
-    # Run every 10 training sessions
-    return (lifecycle.training_session_count or 0) % 10 == 0 \
-        and (lifecycle.training_session_count or 0) > 0
+    count = lifecycle.training_session_count or 0
+    return count > 0 and count % 10 == 0
 
 
 async def run_pattern_abstraction(agent_id: str, db: AsyncSession) -> dict | None:
     """
-    Takes the last 10 memories and extracts patterns — the wisdom layer.
-    What instincts are forming? What values are becoming clear?
+    Extract behavioral patterns from memories.
+
+    Includes BOTH:
+    - High-weight memories (feeling_weight >= 5) — significant experiences
+    - High-reinforcement low-weight memories (mentioned 3+ times even if low weight)
+      These capture quiet recurring behaviors that define a person just as much
+      as the dramatic moments do.
     """
-    # Get last 10 memories by weight — most impactful ones
-    result = await db.execute(
+    # High-weight memories
+    result_high = await db.execute(
         select(Memory)
         .where(
             Memory.agent_id == agent_id,
@@ -38,14 +41,28 @@ async def run_pattern_abstraction(agent_id: str, db: AsyncSession) -> dict | Non
             Memory.feeling_weight >= 5.0,
         )
         .order_by(Memory.feeling_weight.desc(), Memory.created_at.desc())
-        .limit(10)
+        .limit(8)
     )
-    memories = result.scalars().all()
+    high_weight = result_high.scalars().all()
 
+    # High-reinforcement memories (recurring even if low weight)
+    result_reinf = await db.execute(
+        select(Memory)
+        .where(
+            Memory.agent_id == agent_id,
+            Memory.is_active == True,
+            Memory.reinforcement_count >= 2,
+            Memory.feeling_weight < 5.0,  # not already captured above
+        )
+        .order_by(Memory.reinforcement_count.desc())
+        .limit(4)
+    )
+    high_reinf = result_reinf.scalars().all()
+
+    memories = list(high_weight) + list(high_reinf)
     if len(memories) < 3:
-        return None  # Not enough memories yet
+        return None
 
-    # Build memory summary for Claude
     memory_summaries = []
     memory_ids = []
     for m in memories:
@@ -56,34 +73,41 @@ async def run_pattern_abstraction(agent_id: str, db: AsyncSession) -> dict | Non
             "what_i_learned": m.what_i_learned,
             "instinct_formed": m.instinct_formed,
             "feeling_weight": m.feeling_weight,
+            "reinforcement_count": m.reinforcement_count,
             "section": m.section,
             "pattern_tags": m.pattern_tags,
         })
 
-    prompt = f"""You are analyzing a person's memories to extract emerging patterns and wisdom.
-These are their most significant memories. Look across all of them.
+    prompt = f"""You are analyzing a person's most significant memories to extract behavioral patterns.
+These patterns represent WHO this person is — their instincts, values, and automatic reactions.
 
-What patterns are forming? What instincts are being built? What values are becoming clear?
+Look across ALL memories below. Find the patterns that repeat across multiple memories.
+Focus on: what situations trigger the same feeling, what behaviors keep appearing,
+what values keep showing up, what this person instinctively does.
 
-Memories:
+Memories (mix of high-impact and recurring low-impact):
 {json.dumps(memory_summaries, ensure_ascii=False, indent=2)}
 
 Extract 2-4 patterns. Return ONLY valid JSON as a list:
 
 [
   {{
-    "pattern_summary": "English description of the pattern or wisdom",
-    "pattern_summary_original": "Same pattern described naturally — keep same language as the memories",
+    "pattern_summary": "English description of the pattern",
+    "pattern_summary_original": "Same in the person's natural language/voice",
     "pattern_type": "value OR instinct OR belief OR reaction",
-    "abstraction_weight": 7.5
+    "abstraction_weight": 7.5,
+    "trigger": "what situation activates this pattern",
+    "expression": "how this pattern shows in their behavior"
   }}
 ]
 
 Rules:
-- pattern_type: value = what they care about, instinct = automatic behavior, belief = how they see the world, reaction = how they respond to situations
-- abstraction_weight = average weight of memories that formed this pattern
-- Be specific — not generic wisdom. This person's actual patterns.
-- Keep it conversational — not philosophical"""
+- pattern_type: value=what they care about, instinct=automatic behavior,
+  belief=how they see the world, reaction=how they respond to situations
+- abstraction_weight = weighted average of source memories
+- Be SPECIFIC to this person — not generic wisdom
+- Conversational, not philosophical
+- Only extract patterns that appear in at least 2 memories"""
 
     response = await client.messages.create(
         model="claude-sonnet-4-6",
@@ -99,10 +123,15 @@ Rules:
     raw = raw.strip()
 
     patterns = json.loads(raw)
-
-    import uuid
     saved_patterns = []
+
     for p in patterns:
+        # Generate embedding for semantic retrieval
+        try:
+            embedding = await generate_embedding(p["pattern_summary"])
+        except Exception:
+            embedding = None
+
         pattern = PatternAbstraction(
             agent_id=uuid.UUID(agent_id),
             pattern_summary=p["pattern_summary"],
@@ -112,9 +141,18 @@ Rules:
             abstraction_weight=p.get("abstraction_weight", 7.0),
         )
         db.add(pattern)
+        await db.flush()
+
+        if embedding:
+            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+            await db.execute(
+                sa_text("UPDATE pattern_abstractions SET embedding = :e WHERE id = :id"),
+                {"e": embedding_str, "id": str(pattern.id)},
+            )
+
         saved_patterns.append(p)
 
-    # Update agent wisdom score — average of all pattern weights
+    # Update wisdom score
     result = await db.execute(
         select(func.avg(PatternAbstraction.abstraction_weight)).where(
             PatternAbstraction.agent_id == uuid.UUID(agent_id)
@@ -130,5 +168,4 @@ Rules:
         agent.wisdom_score = round(float(avg_wisdom), 2)
 
     await db.commit()
-
     return {"patterns_extracted": len(saved_patterns), "patterns": saved_patterns}

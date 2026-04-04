@@ -3,3 +3,9 @@
 __pycache__/
 *.pyc
 *.pyo
+
+voice_storage/
+*.mp3
+*.wav
+*.webm
+*.m4a
