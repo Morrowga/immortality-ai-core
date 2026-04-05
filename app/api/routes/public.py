@@ -309,6 +309,7 @@ async def public_chat(
     personality          = retrieval["personality"]
     language_samples     = retrieval["language_samples"]
     conversation_history = retrieval["conversation_history"]
+    known_people         = retrieval["known_people"]
 
     # ── Build relationship profile dict ───────────────────────────────────
     relationship_profile = {
@@ -348,6 +349,7 @@ async def public_chat(
         relationship_profile = relationship_profile,
         conversation_history = conversation_history,
         language_samples     = language_samples,
+        known_people         = known_people, 
     )
 
     # ── Layer 2: Naturalize ───────────────────────────────────────────────

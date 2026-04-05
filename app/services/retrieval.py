@@ -36,39 +36,10 @@ from app.services.embeddings import generate_embedding_for_query
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_all_retrieval_data(
-    *,
-    question: str,
-    agent_id: str,
-    user_id: str,
-    db: AsyncSession,
-    language: str = "en",
-    zone: int = 5,
-    session_key: str = "",
-    fetch_survey: bool = True,          # False in public.py (fetched separately)
-    survey_user_id: str | None = None,  # if different from user_id
+    *, question, agent_id, user_id, db, language="en",
+    zone=5, session_key="", fetch_survey=True, survey_user_id=None,
 ) -> dict:
-    """
-    Run all retrieval in two parallel tracks:
 
-    Track A (concurrent — pure network/CPU, no DB):
-        - OpenAI embedding for memory search
-        - OpenAI embedding for pattern search
-          (same question → same embedding, so we generate once and reuse)
-
-    Track B (concurrent — ORM queries, safe to gather):
-        - get_style_profile
-        - get_slang_for_language
-        - get_personality_summary
-        - get_language_samples
-        - get_conversation_history
-        - fetch survey (optional)
-
-    After both tracks finish:
-        - Run memory vector search  } sequentially on the
-        - Run pattern vector search } same raw connection
-    """
-
-    # ── Track A + B in parallel ───────────────────────────────────────────
     embedding_task = asyncio.create_task(
         generate_embedding_for_query(question, language=language)
     )
@@ -80,15 +51,14 @@ async def fetch_all_retrieval_data(
         _get_language_samples(agent_id, language, db, zone),
         _get_conversation_history(agent_id, session_key, db),
         _get_survey(survey_user_id or user_id, db) if fetch_survey else _noop(),
+        _get_known_people(agent_id, db),  
     )
 
     embedding, orm_results = await asyncio.gather(embedding_task, orm_tasks)
 
-    style, slang, personality, language_samples, conversation_history, survey = orm_results
+    style, slang, personality, language_samples, conversation_history, survey, known_people = orm_results
 
-    # ── Vector searches — sequential on one raw connection ────────────────
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
     raw_conn = await db.connection()
     asyncpg_conn = await raw_conn.get_raw_connection()
     native_conn = asyncpg_conn.driver_connection
@@ -105,6 +75,7 @@ async def fetch_all_retrieval_data(
         "language_samples":     language_samples,
         "conversation_history": conversation_history,
         "survey":               survey,
+        "known_people":         known_people, 
     }
 
 
@@ -447,3 +418,25 @@ async def get_conversation_history(
     agent_id: str, session_key: str, db: AsyncSession, limit: int = 6,
 ) -> list[dict]:
     return await _get_conversation_history(agent_id, session_key, db, limit)
+
+async def _get_known_people(agent_id: str, db: AsyncSession) -> list[dict]:
+    result = await db.execute(
+        select(RelationshipProfile)
+        .where(
+            RelationshipProfile.agent_id == uuid.UUID(agent_id),
+            RelationshipProfile.is_active == True,
+        )
+        .order_by(RelationshipProfile.zone, RelationshipProfile.person_name)
+    )
+    people = result.scalars().all()
+
+    return [
+        {
+            "person_name":    p.person_name,
+            "person_aliases": p.person_aliases or [],
+            "person_role":    p.person_role or "",
+            "zone":           p.zone,
+            "address_forms":  p.address_forms or [],   # ← add this
+        }
+        for p in people
+    ]

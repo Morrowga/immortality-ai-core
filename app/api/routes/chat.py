@@ -385,6 +385,7 @@ async def chat(
     language_samples     = retrieval["language_samples"]
     conversation_history = retrieval["conversation_history"]
     survey               = retrieval["survey"]
+    known_people         = retrieval["known_people"]
 
     owner_age:       int | None = survey.age       if survey else None
     owner_birthdate: str | None = survey.birthdate if survey else None
@@ -443,6 +444,7 @@ async def chat(
         relationship_profile = relationship_profile,
         conversation_history = conversation_history,
         language_samples     = language_samples,
+        known_people         = known_people, 
     )
 
     print(f"[L1 DRAFT] {draft}")
