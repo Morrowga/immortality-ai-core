@@ -5,6 +5,7 @@ from app.core.config import settings
 from app.language_packs import get_generation_rules, get_common_mistakes, get_language_name
 from app.services.extraction import format_voice_fingerprint_for_prompt
 from datetime import datetime, timezone
+from app.services.system_slang import build_slang_comprehension_block
 
 client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
@@ -61,6 +62,7 @@ async def generate_agent_response(
     conversation_history: list[dict] = [],
     language_samples: list[str] = [],
     known_people: list[dict] = [], 
+    ambiguity: dict = None,
 ) -> str:
 
     # ── Style context ───────────────────────────────────────────────────────
@@ -93,6 +95,9 @@ Communication style:
             if s.get("grammar_note"):
                 slang_context += f"    Grammar: {s['grammar_note']}\n"
         slang_context += "\nUse naturally. Only when meaning fits.\n"
+
+    # ── System slang comprehension ──────────────────────────────────────────
+    system_slang_block = build_slang_comprehension_block(language, question)
 
     # ── Language samples ────────────────────────────────────────────────────
     samples_context = ""
@@ -381,20 +386,38 @@ FACT{extra}{time_note}:
             relationship_voice_block = (
                 f"\nYOUR VOICE WITH THIS PERSON — follow this exactly:\n{rel_voice}\n"
             )
+        
+    # ── Ambiguity block ─────────────────────────────────────────────────────
+    ambiguity_block = ""
+    if ambiguity and ambiguity.get("ambiguous"):
+        subjects = ambiguity.get("subjects", [])
+        subjects_str = ", ".join(f'"{s}"' for s in subjects) if subjects else "multiple distinct things"
+        ambiguity_block = f"""
+⚠ AMBIGUITY WARNING:
+The question is vague and your memories match multiple distinct subjects: {subjects_str}
+DO NOT pick one and answer. DO NOT guess.
+Ask the speaker which one they mean — ONE short question, in your natural voice.
+After they clarify → answer normally.
+"""
 
     # ── User prompt (fully dynamic — never cached) ──────────────────────────
     user_prompt = f"""═══════════════════════════════════════
 {speaker_block}
 {relationship_voice_block}
 ═══════════════════════════════════════
-
+{ambiguity_block}
+{system_slang_block}
 YOUR FACTS — everything below is true about you:
 {memory_context}
+
+NEVER use em dash (—) in responses.
+Write naturally flowing sentences instead.
+Use comma, new line, or just continue the sentence naturally.
 
 {speaker_name or "Someone"} asks you:
 {question}
 
-Look through your facts above. If any fact answers this — say it directly.
+Look through your facts above. If any fact answers this, say it directly.
 Respond in your natural voice. Short, human, conversational.
 Match the rhythm and style of your real writing samples."""
 

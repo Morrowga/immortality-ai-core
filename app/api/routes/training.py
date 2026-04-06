@@ -5,8 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 import uuid
 import asyncio
-from datetime import datetime
-
+from datetime import datetime,timedelta
 from app.db.session import get_db
 from app.models.user import User, AgentProfile, Memory, TrainingSession, StyleProfile, AgentLifecycle
 from app.core.security import get_current_user
@@ -53,6 +52,19 @@ async def submit_training(
         raise HTTPException(
             status_code=403,
             detail="Complete your personality survey first before training."
+        )
+        
+    recent_count_result = await db.execute(
+        select(func.count(TrainingSession.id)).where(
+            TrainingSession.user_id == current_user.id,
+            TrainingSession.created_at > datetime.utcnow() - timedelta(hours=1),
+        )
+    )
+
+    if (recent_count_result.scalar() or 0) >= 20:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many submissions. Please wait a while before training again.",
         )
 
     result = await db.execute(

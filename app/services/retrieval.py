@@ -66,6 +66,8 @@ async def fetch_all_retrieval_data(
     memories = await _vector_search_memories(native_conn, embedding_str, agent_id)
     patterns = await _vector_search_patterns(native_conn, embedding_str, agent_id)
 
+    ambiguity = await detect_memory_ambiguity(question, memories)
+
     return {
         "memories":             memories,
         "patterns":             patterns,
@@ -76,6 +78,7 @@ async def fetch_all_retrieval_data(
         "conversation_history": conversation_history,
         "survey":               survey,
         "known_people":         known_people, 
+        "ambiguity":            ambiguity,
     }
 
 
@@ -440,3 +443,68 @@ async def _get_known_people(agent_id: str, db: AsyncSession) -> list[dict]:
         }
         for p in people
     ]
+
+async def detect_memory_ambiguity(
+    question: str,
+    memories: list[dict],
+) -> dict:
+    """
+    Send top memories + question to Haiku.
+    Detects if memories are about multiple distinct subjects
+    that the question is ambiguous about.
+
+    Returns:
+      {"ambiguous": False}
+      {"ambiguous": True, "subjects": ["girl from Mandalay", "girl from work", "Aye Aye"]}
+    """
+    if len(memories) < 2:
+        return {"ambiguous": False}
+
+    from anthropic import AsyncAnthropic
+    from app.core.config import settings
+    import json
+
+    ac = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+    # Build memory summary for Haiku — just what_happened, keep it short
+    memory_lines = ""
+    for i, m in enumerate(memories[:6], 1):
+        memory_lines += f"  Memory {i}: {m.get('what_happened', '')[:150]}\n"
+
+    prompt = f"""Someone asked: "{question}"
+
+These memories were retrieved:
+{memory_lines}
+
+Question: Are these memories about multiple DISTINCT subjects that the question is vague about?
+
+Examples of ambiguous:
+- Question "how was your girl" + memories about 3 different women → ambiguous
+- Question "what happened with your car" + memories about Honda, Toyota, Mazda → ambiguous
+- Question "how was the trip" + memories about Bali trip and Japan trip → ambiguous
+
+Examples of NOT ambiguous:
+- Question "how was your girl" + all memories about same person → not ambiguous
+- Question "how are you feeling" + memories all about owner's emotions → not ambiguous
+- Question "what about your job" + one job memory → not ambiguous
+
+Return ONLY valid JSON. No explanation. No markdown.
+
+If NOT ambiguous: {{"ambiguous": false}}
+If ambiguous: {{"ambiguous": true, "subjects": ["brief label for subject 1", "brief label for subject 2"]}}
+
+Keep subject labels short — max 5 words each."""
+
+    try:
+        response = await ac.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1].lstrip("json").strip()
+        return json.loads(raw)
+    except Exception:
+        # Never block chat over ambiguity detection failure
+        return {"ambiguous": False}
