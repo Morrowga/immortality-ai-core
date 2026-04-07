@@ -38,7 +38,9 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     language = Column(String(10), default="en")
     gender   = Column(String(20), nullable=True)
-    subscription_tier = Column(String(50), default="free")
+    plan           = Column(String(20),  default="tester",  nullable=False)
+    souls_balance  = Column(Integer,     default=600,       nullable=False)
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -448,3 +450,28 @@ class NeoPackage(Base):
     is_publishable       = Column(Boolean, default=False)       # future marketplace — don't build yet
     installed_at         = Column(DateTime, default=datetime.utcnow)
     updated_at           = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class SoulsTransaction(Base):
+    """
+    Immutable ledger of every souls movement.
+    Never update rows — only insert.
+ 
+    reason values:
+      "signup_tester"     — 600 Souls granted on register (tester plan)
+      "signup_paid"       — 1000 Souls granted on paid plan activation
+      "refill_pack"       — 1,000 Souls purchased ($12)
+      "training_submit"   — deducted on training submit (~29 Souls)
+      "chat_message_en"   — deducted on EN chat message (~47 Souls)
+      "chat_message_intl" — deducted on MY/TH/KO chat message (~55 Souls)
+      "admin_grant"       — manual grant by admin
+      "refund"            — manual refund
+    """
+    __tablename__ = "souls_transactions"
+ 
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id    = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    amount     = Column(Integer, nullable=False)          # positive = credit, negative = debit
+    reason     = Column(String(50), nullable=False)
+    balance_after = Column(Integer, nullable=False)       # snapshot after transaction
+    meta       = Column(JSONB, nullable=True)             # extra context: session_key, language, etc.
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

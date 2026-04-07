@@ -1,64 +1,49 @@
 """
 app/neo_packages/__init__.py
 
-Registry of all system packages.
+Auto-discovery registry — no manual imports needed.
 
 To add a new system package:
   1. Create app/neo_packages/{key}.py following the template
-  2. Import it here and add to SYSTEM_PACKAGES
+  2. That's it. It registers itself automatically.
 
-That's it. No DB changes needed for system packages.
+Required fields in each package file:
+  PACKAGE_KEY, TITLE, DESCRIPTION, DOMAIN_TAGS,
+  BASE_INSTRUCTIONS, EXAMPLE_TOPICS, SAFETY_DISCLAIMER, SENSITIVE
 """
 
-from app.neo_packages.life_coach import (
-    PACKAGE_KEY as _lc_key,
-    TITLE as _lc_title,
-    DESCRIPTION as _lc_desc,
-    DOMAIN_TAGS as _lc_tags,
-    BASE_INSTRUCTIONS as _lc_base,
-    EXAMPLE_TOPICS as _lc_topics,
-    SAFETY_DISCLAIMER as _lc_disclaimer,
-    SENSITIVE as _lc_sensitive,
-)
+import importlib
+import pkgutil
+from pathlib import Path
 
-from app.neo_packages.politician import (
-    PACKAGE_KEY as _po_key,
-    TITLE as _po_title,
-    DESCRIPTION as _po_desc,
-    DOMAIN_TAGS as _po_tags,
-    BASE_INSTRUCTIONS as _po_base,
-    EXAMPLE_TOPICS as _po_topics,
-    SAFETY_DISCLAIMER as _po_disclaimer,
-    SENSITIVE as _po_sensitive,
-)
+# ── Auto-discover all package files in this folder ────────────────────────
 
-# ── Registry ──────────────────────────────────────────────────────────────
-# Each entry is the full package definition dict.
-# Add new packages here as you create them.
+SYSTEM_PACKAGES: dict[str, dict] = {}
 
-SYSTEM_PACKAGES: dict[str, dict] = {
-    "life_coach": {
-        "package_key":        _lc_key,
-        "title":              _lc_title,
-        "description":        _lc_desc,
-        "domain_tags":        _lc_tags,
-        "base_instructions":  _lc_base,
-        "example_topics":     _lc_topics,
-        "safety_disclaimer":  _lc_disclaimer,
-        "sensitive":          _lc_sensitive,
-    },
-    "politician": {
-        "package_key":        _po_key,
-        "title":              _po_title,
-        "description":        _po_desc,
-        "domain_tags":        _po_tags,
-        "base_instructions":  _po_base,
-        "example_topics":     _po_topics,
-        "safety_disclaimer":  _po_disclaimer,
-        "sensitive":          _po_sensitive,
-    },
-}
+for _finder, _module_name, _ in pkgutil.iter_modules([str(Path(__file__).parent)]):
+    try:
+        _module = importlib.import_module(f"app.neo_packages.{_module_name}")
+    except Exception:
+        continue
 
+    # Only register files that define PACKAGE_KEY
+    if not hasattr(_module, "PACKAGE_KEY"):
+        continue
+
+    _key = _module.PACKAGE_KEY
+    SYSTEM_PACKAGES[_key] = {
+        "package_key":        _key,
+        "title":              getattr(_module, "TITLE",               _key),
+        "description":        getattr(_module, "DESCRIPTION",         ""),
+        "domain_tags":        getattr(_module, "DOMAIN_TAGS",         []),
+        "base_instructions":  getattr(_module, "BASE_INSTRUCTIONS",   ""),
+        "example_topics":     getattr(_module, "EXAMPLE_TOPICS",      []),
+        "safety_disclaimer":  getattr(_module, "SAFETY_DISCLAIMER",   None),
+        "sensitive":          getattr(_module, "SENSITIVE",           False),
+    }
+
+
+# ── Public API — identical to before, nothing in neo.py needs to change ──
 
 def get_system_package(package_key: str) -> dict | None:
     """Return full package definition or None if not found."""
@@ -69,10 +54,10 @@ def list_system_packages() -> list[dict]:
     """Return all system packages as a list for the package browser."""
     return [
         {
-            "package_key": v["package_key"],
-            "title":       v["title"],
-            "description": v["description"],
-            "sensitive":   v["sensitive"],
+            "package_key":    v["package_key"],
+            "title":          v["title"],
+            "description":    v["description"],
+            "sensitive":      v["sensitive"],
             "example_topics": v["example_topics"],
         }
         for v in SYSTEM_PACKAGES.values()

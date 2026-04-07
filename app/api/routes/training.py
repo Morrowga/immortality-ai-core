@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 import uuid
 import asyncio
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
 from app.db.session import get_db
 from app.models.user import User, AgentProfile, Memory, TrainingSession, StyleProfile, AgentLifecycle
 from app.core.security import get_current_user
@@ -15,6 +15,7 @@ from app.services.extraction import (
     extract_memory, check_duplicate_memory, reinforce_memory,
     extract_voice_fingerprint, merge_voice_fingerprints,
 )
+from app.services.souls import deduct, check_balance, tokens_to_souls
 
 router = APIRouter()
 
@@ -53,7 +54,29 @@ async def submit_training(
             status_code=403,
             detail="Complete your personality survey first before training."
         )
-        
+
+    # ── Pre-flight balance check ──────────────────────────────────────────
+    balance = await check_balance(str(current_user.id), db)
+    if balance < 1:
+        plan = current_user.plan
+        if plan == "tester":
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code":    "souls_depleted_tester",
+                    "message": "Your free Souls have been used. Upgrade to continue.",
+                    "balance": balance,
+                }
+            )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code":    "souls_depleted",
+                "message": "You're out of Souls. Purchase a refill pack to continue.",
+                "balance": balance,
+            }
+        )
+
     recent_count_result = await db.execute(
         select(func.count(TrainingSession.id)).where(
             TrainingSession.user_id == current_user.id,
@@ -83,8 +106,9 @@ async def submit_training(
     db.add(session)
     await db.flush()
 
+    # ── Run both Haiku calls in parallel, capturing tokens from each ──────
     try:
-        extracted, fingerprint = await asyncio.gather(
+        (extracted, ext_tokens), (fingerprint, fp_tokens) = await asyncio.gather(
             extract_memory(
                 text=data.text,
                 language=current_user.language,
@@ -99,6 +123,23 @@ async def submit_training(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+    total_tokens = ext_tokens + fp_tokens
+    souls_cost   = tokens_to_souls(total_tokens)
+    print(f"[BILLING/TRAIN] total_tokens={total_tokens} souls_cost={souls_cost}")
+
+    # ── Deduct Souls based on actual token usage ──────────────────────────
+    await deduct(
+        user_id = str(current_user.id),
+        cost    = souls_cost,
+        reason  = "training_submit",
+        db      = db,
+        meta    = {
+            "total_tokens":      total_tokens,
+            "extraction_tokens": ext_tokens,
+            "fingerprint_tokens": fp_tokens,
+        },
+    )
+
     if fingerprint and style:
         existing_fp = style.voice_fingerprint or {}
         style.voice_fingerprint = merge_voice_fingerprints(existing_fp, fingerprint)
@@ -108,9 +149,11 @@ async def submit_training(
     await db.commit()
 
     return {
-        "session_id": str(session.id),
-        "extracted": extracted,
+        "session_id":   str(session.id),
+        "extracted":    extracted,
         "original_text": data.text,
+        "souls_deducted": souls_cost,
+        "tokens_used":  total_tokens,
     }
 
 
@@ -120,6 +163,7 @@ async def confirm_memory(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # confirm is pure DB work — no Claude calls, no Soul deduction
     result = await db.execute(
         select(AgentProfile).where(AgentProfile.user_id == current_user.id)
     )
@@ -147,7 +191,6 @@ async def confirm_memory(
             db=db,
         )
 
-        # Reinforce gives a small wisdom bump — it's a repeat, not new knowledge
         agent.wisdom_score    = min(WISDOM_CAP, (agent.wisdom_score or 0.0) + 0.2)
         agent.last_updated_at = datetime.utcnow()
         await db.commit()
@@ -196,8 +239,6 @@ async def confirm_memory(
         {"embedding": embedding_str, "id": str(memory.id)}
     )
 
-    # New memory: wisdom += feeling_weight * 0.1
-    # Weight-5 → +0.5, weight-9 → +0.9. At 50 memories avg weight-7 → ~35 pts.
     increment             = round(data.feeling_weight * 0.1, 3)
     agent.wisdom_score    = min(WISDOM_CAP, (agent.wisdom_score or 0.0) + increment)
     agent.total_memories  = (agent.total_memories or 0) + 1
@@ -221,8 +262,6 @@ async def confirm_memory(
 
     await db.commit()
 
-    # Pattern abstraction runs every 10 sessions and blends in avg pattern weight —
-    # compounds naturally on top of the per-memory increments above.
     try:
         if await should_run_abstraction(str(agent.id), db):
             await run_pattern_abstraction(str(agent.id), db)

@@ -1,11 +1,5 @@
 """
 app/api/routes/public.py
-
-Changes from previous version:
-  - Added BackgroundTasks to public_chat endpoint signature
-  - After db.commit(), count session turns and fire conversation
-    memory extraction every 6 turns as a background task
-  - Everything else unchanged
 """
 
 import re
@@ -31,6 +25,7 @@ from app.services.agent import generate_agent_response
 from app.services.retrieval import fetch_all_retrieval_data
 from app.services.survey import naturalize_response
 from app.services.conversation_memory import maybe_extract_conversation_memory
+from app.services.souls import check_balance, deduct, tokens_to_souls, COST_CHAT_EN
 
 router  = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -169,6 +164,8 @@ async def verify_passphrase(slug: str, data: VerifyRequest, db: AsyncSession = D
         "language":        matched.relationship_language or "en",
     }
     token = _create_session_token(token_payload)
+    balance = await check_balance(str(agent.user_id), db)
+    can_chat = balance >= COST_CHAT_EN
 
     return {
         "session_token":    token,
@@ -179,6 +176,7 @@ async def verify_passphrase(slug: str, data: VerifyRequest, db: AsyncSession = D
         "expires_in_hours": _TOKEN_EXPIRY_HOURS,
         "person_gender":    matched.gender,
         "person_age":       matched.age,
+        "can_chat":         can_chat, 
     }
 
 
@@ -188,7 +186,7 @@ async def verify_passphrase(slug: str, data: VerifyRequest, db: AsyncSession = D
 async def public_chat(
     slug:             str,
     data:             PublicChatRequest,
-    background_tasks: BackgroundTasks,           # ← fires memory extraction after response
+    background_tasks: BackgroundTasks,
     db:               AsyncSession = Depends(get_db),
 ):
     if not data.message.strip():
@@ -204,6 +202,18 @@ async def public_chat(
     agent = await _get_agent_by_slug(slug, db)
     if str(agent.id) != agent_id:
         raise HTTPException(status_code=403, detail="Session token does not match this agent.")
+
+    # ── Pre-flight balance check (deducted from OWNER's balance) ─────────
+    owner_balance = await check_balance(str(agent.user_id), db)
+    if owner_balance < 1:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code":    "souls_depleted",
+                "message": "The agent owner is out of Souls. Please contact them.",
+                "balance": owner_balance,
+            }
+        )
 
     # ── Load profile + role ───────────────────────────────────────────────
     result = await db.execute(
@@ -252,18 +262,15 @@ async def public_chat(
         or "Polite and measured."
     )
 
-    # ── Gender/age: request → profile fallback ────────────────────────────
     effective_gender = data.speaker_gender or profile.gender
     effective_age    = data.speaker_age    or profile.age
 
-    # ── Owner info + language ─────────────────────────────────────────────
     from app.models.user import User
     owner_result = await db.execute(select(User).where(User.id == agent.user_id))
     owner = owner_result.scalar_one_or_none()
     owner_language    = (owner.language or "en") if owner else "en"
     response_language = profile.relationship_language or owner_language
 
-    # ── Survey for owner birthdate (age gap) ──────────────────────────────
     survey_result = await db.execute(
         select(PersonalitySurvey).where(
             PersonalitySurvey.agent_id     == agent.id,
@@ -273,7 +280,6 @@ async def public_chat(
     survey = survey_result.scalar_one_or_none()
     owner_birthdate: str | None = survey.birthdate if survey else None
 
-    # ── Age gap + address form ────────────────────────────────────────────
     age_gap: int | None = None
     if effective_age is not None:
         from app.api.routes.chat import _compute_age_gap
@@ -290,7 +296,6 @@ async def public_chat(
         speaker_name       = speaker_name,
     )
 
-    # ── Parallel retrieval ────────────────────────────────────────────────
     retrieval = await fetch_all_retrieval_data(
         question=data.message,
         agent_id=str(agent.id),
@@ -312,7 +317,6 @@ async def public_chat(
     known_people         = retrieval["known_people"]
     ambiguity            = retrieval["ambiguity"]
 
-    # ── Build relationship profile dict ───────────────────────────────────
     relationship_profile = {
         "zone":               zone,
         "person_name":        speaker_name,
@@ -334,8 +338,10 @@ async def public_chat(
 
     from app.api.routes.chat import _correct_pronouns
 
+    total_tokens = 0
+
     # ── Layer 1: Sonnet ───────────────────────────────────────────────────
-    draft = await generate_agent_response(
+    draft, l1_tokens = await generate_agent_response(
         question             = data.message,
         memories             = memories,
         patterns             = patterns,
@@ -353,18 +359,20 @@ async def public_chat(
         known_people         = known_people, 
         ambiguity            = ambiguity
     )
+    total_tokens += l1_tokens
 
     # ── Layer 2: Naturalize ───────────────────────────────────────────────
-    naturalized = await naturalize_response(
+    naturalized, l2_tokens = await naturalize_response(
         draft_response             = draft,
         language                   = response_language,
         real_samples               = language_samples,
         zone                       = zone,
         relationship_voice_summary = profile.voice_summary or "",
     )
+    total_tokens += l2_tokens
 
     # ── Layer 3: Pronoun correction ───────────────────────────────────────
-    response_text = await _correct_pronouns(
+    response_text, l3_tokens = await _correct_pronouns(
         response            = naturalized,
         language            = response_language,
         address_forms       = addr_forms,
@@ -375,6 +383,25 @@ async def public_chat(
         speaker_gender      = effective_gender,
         speaker_age         = age_gap,
         resolved_address    = resolved_address,
+    )
+    total_tokens += l3_tokens
+
+    # ── Deduct Souls from OWNER's balance ─────────────────────────────────
+    souls_cost = tokens_to_souls(total_tokens)
+    print(f"[BILLING/PUBLIC] total_tokens={total_tokens} souls_cost={souls_cost}")
+    await deduct(
+        user_id = str(agent.user_id),
+        cost    = souls_cost,
+        reason  = "public_chat_message",
+        db      = db,
+        meta    = {
+            "total_tokens":  total_tokens,
+            "l1_tokens":     l1_tokens,
+            "l2_tokens":     l2_tokens,
+            "l3_tokens":     l3_tokens,
+            "language":      response_language,
+            "speaker_name":  speaker_name,
+        },
     )
 
     # ── Save ──────────────────────────────────────────────────────────────
@@ -400,8 +427,6 @@ async def public_chat(
     await db.commit()
 
     # ── Conversation memory extraction ────────────────────────────────────
-    # Fires every 6 turns as a background task — zero latency impact.
-    # Only public chat extracts memories (owner chat is for testing only).
     if data.session_key:
         turn_count_result = await db.execute(
             select(func.count(AgentResponse.id)).where(
@@ -427,6 +452,8 @@ async def public_chat(
         "response_id":   str(agent_response.id),
         "zone":          zone,
         "speaker_name":  speaker_name,
+        "souls_deducted": souls_cost,
+        "tokens_used":   total_tokens,
     }
 
 
@@ -504,10 +531,6 @@ async def update_agent_slug(
 
 @router.get("/{slug}/image")
 async def get_public_agent_image(slug: str, db: AsyncSession = Depends(get_db)):
-    """
-    Serve the agent's profile image publicly — no auth required.
-    Returns 404 if the agent has no image (frontend falls back to letter avatar).
-    """
     from fastapi.responses import FileResponse
     from pathlib import Path
     import os

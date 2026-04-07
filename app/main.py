@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.api.routes import (
     health, auth, memories, agents, training, 
     chat, slang, survey, feedback, relationships, 
-    voice, public, access_keys, chat_history, neo
+    voice, public, access_keys, chat_history, neo, billing
 )
 
 @asynccontextmanager
@@ -44,3 +44,4 @@ app.include_router(public.router,prefix="/public",tags=["public"])
 app.include_router(access_keys.router, prefix="/api/access-keys", tags=["access-keys"])
 app.include_router(chat_history.router, prefix="/api/chat", tags=["chat-history"])
 app.include_router(neo.router, prefix="/api/neo", tags=["neo"])
+app.include_router(billing.router, prefix="/api/billing", tags=["billing"])

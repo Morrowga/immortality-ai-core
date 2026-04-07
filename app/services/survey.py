@@ -242,50 +242,48 @@ async def naturalize_response(
     real_samples: list[str],
     zone: int = 4,
     relationship_voice_summary: str = "",
-) -> str:
+) -> tuple[str, int]:
     """
     Layer 2 — rewrite draft to match the trainer's real writing rhythm.
-
-    Short-circuits if no samples and no voice summary — returns draft as-is.
-    Injects language pack naturalization rules if a pack exists for this language.
+ 
+    Returns (naturalized_text, tokens_used).
+    tokens_used = 0 if short-circuited (no samples and no voice summary).
     """
     if not real_samples and not relationship_voice_summary:
-        return draft_response
-
+        return draft_response, 0
+ 
     lang_name = LANGUAGE_SCRIPT_NAMES.get(language, language)
     zone_desc = ZONE_DESCRIPTIONS.get(zone, "")
-
+ 
     samples_block = ""
     if real_samples:
         samples_block = f"\nReal examples of how this person writes ({lang_name}):\n"
         for s in real_samples[:6]:
             samples_block += f'  "{s}"\n'
-
+ 
     voice_block = ""
     if relationship_voice_summary:
         voice_block = f"\nVoice guide:\n{relationship_voice_summary}\n"
-
-    # ── Language pack naturalization rules ────────────────────────────────
-    # Injected only if a pack exists — transparent no-op for unsupported languages
+ 
     nat_rules = get_naturalize_rules(language)
     pack_block = ""
     if nat_rules:
         pack_block = f"\nLanguage-specific rules:\n{nat_rules}\n"
-
+ 
     prompt = f"""Rewrite this message to sound exactly like how this specific person naturally writes.
-
+ 
 DO NOT change meaning, facts, or emotional content.
 ONLY change: sentence rhythm, word choice, formality, natural language patterns.
-
+ 
 Target language: {lang_name}
 Relationship: {zone_desc}
 {samples_block}
 {voice_block}
 {pack_block}
-
+ 
 Draft:
 {draft_response}
-
+ 
 Rules:
 - Match rhythm and length of real samples
 - Mix languages exactly as they do
@@ -293,64 +291,28 @@ Rules:
 - Do NOT make it more formal
 - Do NOT add content not in the draft
 - Output ONLY the rewritten message."""
-
-    return await _call_claude(
-        [{"role": "user", "content": prompt}],
-        model="claude-haiku-4-5-20251001",
-        max_tokens=600,
-    )
-
-
-# ── Language sample extraction ─────────────────────────────────────────────
-
-async def extract_language_samples_from_text(
-    text: str,
-    language: str,
-    agent_id: str,
-    user_id: str,
-    zone: int = None,
-    source: str = "training",
-) -> list[dict]:
-    """
-    Extract natural conversational sentences from training input.
-    Stored as LanguageSample rows — used by naturalize_response later.
-    """
-    if len(text) < 20:
-        return []
-
-    prompt = f"""Extract natural conversational sentences from this text.
-
-Text: {text}
-
-Rules:
-- Only natural and conversational sentences
-- 3-6 sentences maximum
-- Preserve EXACTLY as written — do not clean, translate, or fix
-- Include language mixing if present
-- Skip sentences under 5 words or too generic
-- Return ONLY a JSON array of strings.
-
-Example: ["ဒါကြောင့် မသွားတော့ဘူး lol", "အခုတော့ okay ဖြစ်သွားပြီ"]"""
-
-    raw = await _call_claude(
-        [{"role": "user", "content": prompt}],
-        max_tokens=400,
-    )
-    try:
-        sentences = _parse_json(raw)
-        if not isinstance(sentences, list):
-            return []
-        return [
-            {
-                "user_id": user_id,
-                "agent_id": agent_id,
-                "language": language,
-                "sample_text": s,
-                "relationship_zone": zone,
-                "source": source,
-            }
-            for s in sentences
-            if isinstance(s, str) and len(s) > 5
-        ]
-    except Exception:
-        return []
+ 
+    last_error = None
+    for attempt in range(5):
+        try:
+            response = await client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+            return response.content[0].text.strip(), tokens_used
+        except (InternalServerError, APIStatusError) as e:
+            status = getattr(e, "status_code", None)
+            err = str(e).lower()
+            if status in (429, 529) or "overload" in err:
+                last_error = e
+                wait = 5 * (attempt + 1) if status == 429 else 2 ** attempt
+                await asyncio.sleep(wait + random.uniform(0, 0.5))
+                continue
+            raise
+    from fastapi import HTTPException
+    raise HTTPException(
+        status_code=503,
+        detail="Anthropic overloaded. Try again shortly."
+    ) from last_error

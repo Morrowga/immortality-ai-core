@@ -98,7 +98,11 @@ async def extract_memory(
     text: str,
     language: str = "en",
     style_context: str = "",
-) -> dict:
+) -> tuple[dict, int]:
+    """
+    Returns (extracted_memory_dict, tokens_used).
+    tokens_used = input_tokens + output_tokens for this call.
+    """
     user_prompt = f"""User's primary language: {language}
 Style context: {style_context if style_context else "No prior style data yet"}
 
@@ -135,6 +139,8 @@ Extract the felt memory. Preserve original voice exactly. Return only JSON."""
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="Anthropic is currently overloaded. Please try again in a moment.") from last_error
 
+    tokens_used = response.usage.input_tokens + response.usage.output_tokens
+
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -142,25 +148,19 @@ Extract the felt memory. Preserve original voice exactly. Return only JSON."""
             raw = raw[4:]
     raw = raw.strip()
 
-    return json.loads(raw)
+    return json.loads(raw), tokens_used
 
 
 async def extract_voice_fingerprint(
     text: str,
     language: str = "en",
-) -> dict | None:
+) -> tuple[dict | None, int]:
     """
-    Extract voice fingerprint from raw training text.
-    Analyzes HOW the person communicates — rhythm, energy, filler words,
-    code-mixing, humor style, directness.
-
-    Returns None if text is too short to analyze meaningfully.
-    Called alongside extract_memory() in training.py — runs in parallel.
-
-    Uses Haiku — cheap and fast. Fingerprint extraction doesn't need deep reasoning.
+    Returns (fingerprint_dict_or_None, tokens_used).
+    tokens_used = 0 if text is too short or call fails.
     """
     if not text or len(text.strip()) < 30:
-        return None
+        return None, 0
 
     import random
     user_prompt = f"""Primary language of writer: {language}
@@ -179,13 +179,14 @@ Return only JSON."""
                 system=FINGERPRINT_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}]
             )
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
             raw = response.content[0].text.strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
             raw = raw.strip()
-            return json.loads(raw)
+            return json.loads(raw), tokens_used
 
         except (InternalServerError, APIStatusError) as e:
             status = getattr(e, "status_code", None)
@@ -194,31 +195,17 @@ Return only JSON."""
                 last_error = e
                 await asyncio.sleep((2 ** attempt) + random.uniform(0, 0.3))
                 continue
-            # Non-retryable error — don't crash training, just skip fingerprint
-            return None
+            return None, 0
         except Exception:
-            # Never crash training over a fingerprint failure
-            return None
+            return None, 0
 
-    return None
+    return None, 0
 
 
 def merge_voice_fingerprints(
     existing: dict | None,
     new: dict | None,
 ) -> dict | None:
-    """
-    Merge a new fingerprint reading into the accumulated fingerprint.
-
-    Strategy:
-    - String fields: keep existing if new says "not enough data", else update
-      with a rolling blend — recent sessions have more weight than old ones
-    - List fields (code_mix_words, filler_patterns): union, dedup, keep most common
-    - sample_count: increment
-
-    This is intentionally simple — no ML, just accumulation.
-    The more sessions contribute, the more stable and accurate the fingerprint.
-    """
     if not new:
         return existing
     if not existing:
@@ -230,7 +217,6 @@ def merge_voice_fingerprints(
     sample_count = existing.get("sample_count", 1) + 1
     merged["sample_count"] = sample_count
 
-    # String fields — update if new has real data
     string_fields = [
         "sentence_rhythm", "directness", "humor_style", "trailing_style",
         "emotional_expression", "energy_level", "sentence_starters",
@@ -240,41 +226,26 @@ def merge_voice_fingerprints(
         if new_val and new_val != "not enough data":
             existing_val = existing.get(field, "")
             if not existing_val or existing_val == "not enough data":
-                # First real data for this field — take it
                 merged[field] = new_val
             else:
-                # Both have data — keep existing (stable base) unless
-                # we've only seen 1-2 sessions, in which case update freely
                 if sample_count <= 3:
                     merged[field] = new_val
-                # After 3+ sessions, the existing fingerprint is stable enough
-                # to keep. Occasional new readings won't override it.
 
-    # List fields — union with dedup, capped at 15 items
     for field in ["code_mix_words", "filler_patterns"]:
         existing_list = existing.get(field) or []
         new_list = new.get(field) or []
-        combined = list(dict.fromkeys(existing_list + new_list))  # dedup, preserve order
+        combined = list(dict.fromkeys(existing_list + new_list))
         merged[field] = combined[:15]
 
     return merged
 
 
 def format_voice_fingerprint_for_prompt(fingerprint: dict | None) -> str:
-    """
-    Format the accumulated voice fingerprint into a concrete prompt block
-    for agent.py Layer 1.
-
-    Returns empty string if no fingerprint — transparent no-op.
-    Returns concrete style instructions, not vague descriptions.
-    """
     if not fingerprint:
         return ""
 
     sample_count = fingerprint.get("sample_count", 0)
     if sample_count < 2:
-        # Only one training session — not enough signal yet
-        # Don't inject anything that might mislead the agent
         return ""
 
     lines = ["HOW THIS PERSON WRITES — match this exactly:"]
@@ -315,6 +286,10 @@ async def generate_acknowledgment(
     user_name: str,
     language: str = "en",
 ) -> str:
+    """
+    Generates an acknowledgment message. Returns text only — tokens not tracked
+    because this is a UX call after deduction has already been made.
+    """
     prompt = f"""The user just shared a memory with their personal AI agent.
 The agent should acknowledge it — show it understood the feeling, not just the facts.
 

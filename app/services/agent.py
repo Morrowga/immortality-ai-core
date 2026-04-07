@@ -1,3 +1,4 @@
+import math
 import random
 import asyncio
 from anthropic import AsyncAnthropic, InternalServerError, APIStatusError
@@ -46,6 +47,11 @@ def _format_self_address_forms(self_address_forms: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def tokens_to_souls(total_tokens: int) -> int:
+    """Convert raw token count to Souls. 1 Soul = 100 tokens, rounded up."""
+    return max(1, math.ceil(total_tokens / 100))
+
+
 async def generate_agent_response(
     question: str,
     memories: list[dict],
@@ -63,7 +69,12 @@ async def generate_agent_response(
     language_samples: list[str] = [],
     known_people: list[dict] = [], 
     ambiguity: dict = None,
-) -> str:
+) -> tuple[str, int]:
+    """
+    Returns (response_text, tokens_used).
+    tokens_used is the raw input+output token count for this Layer 1 call only.
+    The caller accumulates tokens across all layers then converts to Souls.
+    """
 
     # ── Style context ───────────────────────────────────────────────────────
     style_context = ""
@@ -137,7 +148,6 @@ Communication style:
                 line += f" (also known as: {', '.join(p['person_aliases'])})"
             if p["person_role"]:
                 line += f" — {p['person_role']}"
-            # ← add address form hint
             if p.get("address_forms"):
                 primary = next(
                     (f["form"] for f in p["address_forms"]
@@ -247,12 +257,6 @@ If a memory is [this month] or recent — present it as current.
 """
 
     # ── CACHED system prompt ────────────────────────────────────────────────
-    # Contains ONLY stable content that doesn't change per request:
-    # identity, style, slang, language rules, samples, patterns, answering rules.
-    #
-    # Speaker/relationship context is intentionally excluded — it changes per
-    # speaker and would bust the cache on every message.
-    # Speaker context goes in the user prompt instead.
     system_prompt = f"""You are {agent_name} — a personal AI agent built from this person's real memories and life.
 
 You are NOT a generic AI. You are a reflection of a specific human being.
@@ -319,8 +323,6 @@ FACT{extra}{time_note}:
 """
 
     # ── Speaker context (dynamic — in user prompt) ──────────────────────────
-    # Kept out of system prompt so the cache hit rate stays high.
-    # Speaker changes per conversation; identity/style/language rules don't.
     if is_owner:
         speaker_block = (
             f"WHO IS TALKING: This is YOU — {speaker_name}.\n"
@@ -447,7 +449,8 @@ Match the rhythm and style of your real writing samples."""
                 messages=messages,
                 extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
             )
-            return response.content[0].text.strip()
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+            return response.content[0].text.strip(), tokens_used
 
         except (InternalServerError, APIStatusError) as e:
             status  = getattr(e, "status_code", None)

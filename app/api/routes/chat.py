@@ -1,3 +1,4 @@
+import math
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,7 @@ from app.core.security import get_current_user
 from app.services.agent import generate_agent_response
 from app.services.retrieval import fetch_all_retrieval_data
 from app.services.survey import naturalize_response
+from app.services.souls import deduct, check_balance, tokens_to_souls
 from datetime import datetime, date
 from anthropic import AsyncAnthropic
 from app.core.config import settings
@@ -350,6 +352,31 @@ async def chat(
             detail="Complete your personality survey first before chatting."
         )
 
+    # ── Pre-flight balance check ─────────────────────────────────────────────
+    # Check that the user has at least 1 Soul before firing any API calls.
+    # The exact cost is unknown until calls complete, so we do a minimum check
+    # here and then deduct the real amount after all calls finish.
+    balance = await check_balance(str(current_user.id), db)
+    if balance < 1:
+        plan = current_user.plan
+        if plan == "tester":
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code":    "souls_depleted_tester",
+                    "message": "Your free Souls have been used. Upgrade to continue.",
+                    "balance": balance,
+                }
+            )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code":    "souls_depleted",
+                "message": "You're out of Souls. Purchase a refill pack to continue.",
+                "balance": balance,
+            }
+        )
+
     response_language = data.language or current_user.language
 
     ctx = await _resolve_speaker_context(
@@ -429,8 +456,10 @@ async def chat(
         "forbidden_particles": ctx["forbidden_particles"],
     }
 
+    total_tokens = 0
+
     # ── Layer 1: Sonnet ───────────────────────────────────────────────────
-    draft = await generate_agent_response(
+    draft, l1_tokens = await generate_agent_response(
         question             = data.message,
         memories             = memories,
         patterns             = patterns,
@@ -448,22 +477,22 @@ async def chat(
         known_people         = known_people, 
         ambiguity            = ambiguity,
     )
-
-    print(f"[L1 DRAFT] {draft}")
+    total_tokens += l1_tokens
+    print(f"[L1 DRAFT] {draft} | tokens={l1_tokens}")
 
     # ── Layer 2: Naturalize ───────────────────────────────────────────────
-    naturalized = await naturalize_response(
+    naturalized, l2_tokens = await naturalize_response(
         draft_response             = draft,
         language                   = response_language,
         real_samples               = language_samples,
         zone                       = ctx["zone"],
         relationship_voice_summary = ctx["voice_summary"] or "",
     )
-
-    print(f"[L2 NATURALIZED] {naturalized}")
+    total_tokens += l2_tokens
+    print(f"[L2 NATURALIZED] {naturalized} | tokens={l2_tokens}")
 
     # ── Layer 3: Pronoun correction ───────────────────────────────────────
-    response_text = await _correct_pronouns(
+    response_text, l3_tokens = await _correct_pronouns(
         response            = naturalized,
         language            = response_language,
         address_forms       = ctx["address_forms"],
@@ -475,11 +504,27 @@ async def chat(
         speaker_age         = age_gap,
         resolved_address    = resolved_address,
     )
+    total_tokens += l3_tokens
+    print(f"[L3 CORRECTED] {response_text} | tokens={l3_tokens}")
 
-    print(f"[L3 CORRECTED] {response_text}")
+    # ── Deduct Souls based on actual token usage ──────────────────────────
+    souls_cost = tokens_to_souls(total_tokens)
+    print(f"[BILLING] total_tokens={total_tokens} souls_cost={souls_cost}")
+    await deduct(
+        user_id  = str(current_user.id),
+        cost     = souls_cost,
+        reason   = "chat_message",
+        db       = db,
+        meta     = {
+            "total_tokens": total_tokens,
+            "l1_tokens":    l1_tokens,
+            "l2_tokens":    l2_tokens,
+            "l3_tokens":    l3_tokens,
+            "language":     response_language,
+        },
+    )
 
     # ── Save ──────────────────────────────────────────────────────────────
-    # Owner chat is for testing only — no conversation memory extraction.
     agent_response = AgentResponse(
         user_id       = current_user.id,
         agent_id      = agent.id,
@@ -508,6 +553,8 @@ async def chat(
         "response_id":   str(agent_response.id),
         "role_used":     ctx["role_name"],
         "zone":          ctx["zone"],
+        "souls_deducted": souls_cost,
+        "tokens_used":   total_tokens,
     }
 
 
@@ -524,12 +571,16 @@ async def _correct_pronouns(
     speaker_gender: str | None = None,
     speaker_age: int | None = None,
     resolved_address: str | None = None,
-) -> str:
+) -> tuple[str, int]:
+    """
+    Returns (corrected_text, tokens_used).
+    tokens_used = 0 if this language doesn't need honorific correction.
+    """
     if language not in HONORIFIC_LANGUAGES:
-        return response
+        return response, 0
 
     if not forbidden_particles and not address_forms and not self_address_forms and not resolved_address:
-        return response
+        return response, 0
 
     speaker_context_parts = []
     if speaker_gender and speaker_gender != "prefer_not":
@@ -581,8 +632,9 @@ Message:
             max_tokens=800,
             messages=[{"role": "user", "content": prompt}],
         )
+        tokens_used = result.usage.input_tokens + result.usage.output_tokens
         corrected = result.content[0].text.strip()
         print(f"[L3 RAW] {repr(corrected)}")
-        return corrected if corrected else response
+        return (corrected if corrected else response), tokens_used
     except Exception:
-        return response
+        return response, 0
