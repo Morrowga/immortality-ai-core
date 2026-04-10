@@ -25,7 +25,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
-
+from app.core.encryption import EncryptedText
 from app.db.base import Base
 
 
@@ -239,22 +239,22 @@ class Memory(Base):
     section = Column(String(50), nullable=False, default="PAST")
     cross_sections = Column(ARRAY(String), default=[])
     is_core_memory = Column(Boolean, default=False)
-    transcript_text = Column(Text, nullable=True)
-    transcript_original = Column(Text, nullable=True)
+    transcript_text          = Column(EncryptedText(), nullable=True)
+    transcript_original      = Column(EncryptedText(), nullable=True)
     transcript_language = Column(String(10), default="en")
     audio_file_ref = Column(String(500), nullable=True)
-    what_happened = Column(Text, nullable=True)
-    context = Column(Text, nullable=True)
-    how_i_felt = Column(Text, nullable=True)
-    why_it_mattered = Column(Text, nullable=True)
-    what_i_learned = Column(Text, nullable=True)
-    instinct_formed = Column(Text, nullable=True)
-    cultural_expression_notes = Column(Text, nullable=True)
-    what_happened_original = Column(Text, nullable=True)
-    how_i_felt_original = Column(Text, nullable=True)
-    why_it_mattered_original = Column(Text, nullable=True)
-    what_i_learned_original = Column(Text, nullable=True)
-    instinct_formed_original = Column(Text, nullable=True)
+    what_happened            = Column(EncryptedText(), nullable=True)
+    context                  = Column(EncryptedText(), nullable=True)
+    how_i_felt               = Column(EncryptedText(), nullable=True)
+    why_it_mattered          = Column(EncryptedText(), nullable=True)
+    what_i_learned           = Column(EncryptedText(), nullable=True)
+    instinct_formed          = Column(EncryptedText(), nullable=True)
+    cultural_expression_notes = Column(EncryptedText(), nullable=True)
+    what_happened_original   = Column(EncryptedText(), nullable=True)
+    how_i_felt_original      = Column(EncryptedText(), nullable=True)
+    why_it_mattered_original = Column(EncryptedText(), nullable=True)
+    what_i_learned_original  = Column(EncryptedText(), nullable=True)
+    instinct_formed_original = Column(EncryptedText(), nullable=True)
     feeling_weight = Column(Float, default=5.0)
     never_forget = Column(Boolean, default=False)
     primary_emotion = Column(String(100), nullable=True)

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     VOICE_STORAGE_PATH: str = "voice_storage" 
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
     VOICE_ENABLED: str = "false"
+    ENCRYPTION_KEY: str = "" 
 
     class Config:
         env_file = ".env"
