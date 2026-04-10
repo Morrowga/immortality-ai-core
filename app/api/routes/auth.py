@@ -329,17 +329,12 @@ RELATIONSHIP_SEEDS = {
     ],
 }
 
-def _make_slug(name: str) -> str:
+def _make_slug() -> str:
     """
-    Convert a name to a URL-safe slug.
-    e.g. "Ko Aung Kyaw" → "ko-aung-kyaw"
+    Generate a unique agent ID.
+    e.g. "agent-83721"
     """
-    slug = name.lower().strip()
-    slug = re.sub(r"[^a-z0-9\s-]", "", slug)   # remove special chars
-    slug = re.sub(r"\s+", "-", slug)             # spaces → hyphens
-    slug = re.sub(r"-+", "-", slug).strip("-")   # collapse multiple hyphens
-    return slug or "agent"
-
+    return f"agent-{random.randint(10000, 99999)}"
 
 async def _unique_slug(base: str, db) -> str:
     """
