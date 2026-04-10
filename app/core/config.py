@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     HUME_API_KEY: str = ""
     ELEVENLABS_API_KEY: str = ""
     VOICE_STORAGE_PATH: str = "voice_storage" 
-    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+    ALLOWED_ORIGINS=["https://immtl.com","https://www.immtl.com"]
     VOICE_ENABLED: str = "false"
     ENCRYPTION_KEY: str = "" 
 
