@@ -16,7 +16,6 @@ from app.services.extraction import (
     extract_voice_fingerprint, merge_voice_fingerprints,
 )
 from app.services.souls import deduct, check_balance, tokens_to_souls
-import numpy as np
 
 router = APIRouter()
 
@@ -178,7 +177,7 @@ async def confirm_memory(
         f"{data.extracted.get('instinct_formed', '')}"
     )
     embedding = await generate_embedding(embed_text)
-    # embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
     duplicate = await check_duplicate_memory(
         embedding=embedding,
@@ -232,14 +231,13 @@ async def confirm_memory(
         pattern_tags=data.extracted.get("pattern_tags", []),
         training_mode="manual",
     )
-    memory.embedding = np.array(embedding)
     db.add(memory)
     await db.flush()
 
-    # await db.execute(
-    #     text("UPDATE memories SET embedding = :embedding WHERE id = :id"),
-    #     {"embedding": embedding_str, "id": str(memory.id)}
-    # )
+    await db.execute(
+        text("UPDATE memories SET embedding = :embedding WHERE id = :id"),
+        {"embedding": embedding_str, "id": str(memory.id)}
+    )
 
     increment             = round(data.feeling_weight * 0.1, 3)
     agent.wisdom_score    = min(WISDOM_CAP, (agent.wisdom_score or 0.0) + increment)
