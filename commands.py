@@ -18,3 +18,18 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 # 6. Run the app
 uvicorn app.main:app --reload
+
+# Status
+sudo systemctl status immortality-backend.service
+
+# Restart
+sudo systemctl restart immortality-backend.service
+
+# Stop
+sudo systemctl stop immortality-backend.service
+
+# Logs (live follow)
+sudo journalctl -u immortality-backend.service -f
+
+# Logs (last 100 lines)
+sudo journalctl -u immortality-backend.service -n 100

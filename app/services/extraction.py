@@ -343,11 +343,15 @@ async def check_duplicate_memory(
     db: AsyncSession,
     threshold: float = 0.85,
 ) -> dict | None:
-    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+    from pgvector.asyncpg import register_vector
+    import numpy as np
 
     raw_conn = await db.connection()
     asyncpg_conn = await raw_conn.get_raw_connection()
     native_conn = asyncpg_conn.driver_connection
+
+    # Register vector type so asyncpg handles it natively
+    await register_vector(native_conn)
 
     rows = await native_conn.fetch("""
         SELECT
@@ -358,15 +362,15 @@ async def check_duplicate_memory(
             reinforcement_count,
             never_forget,
             section,
-            1 - (embedding <=> $1::vector) AS similarity
+            1 - (embedding <=> $1) AS similarity
         FROM memories
         WHERE
             agent_id = $2::uuid
             AND is_active = true
             AND embedding IS NOT NULL
-        ORDER BY embedding <=> $1::vector
+        ORDER BY embedding <=> $1
         LIMIT 1
-    """, embedding_str, agent_id)
+    """, np.array(embedding), agent_id)
 
     if not rows:
         return None
