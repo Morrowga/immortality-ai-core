@@ -329,11 +329,12 @@ RELATIONSHIP_SEEDS = {
     ],
 }
 
-def _make_slug() -> str:
+def _make_slug(name: str = "") -> str:
     """
     Generate a unique agent ID.
     e.g. "agent-83721"
     """
+    import random
     return f"agent-{random.randint(10000, 99999)}"
 
 async def _unique_slug(base: str, db) -> str:
