@@ -8,6 +8,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.dialects.postgresql import ARRAY
+from pgvector.sqlalchemy import Vector
 
 revision = '001_init'
 down_revision = None
@@ -133,7 +134,7 @@ def upgrade():
         sa.Column('voice_tone',           sa.String(50), nullable=True),
         sa.Column('hesitation_moments',   JSONB, nullable=True),
         sa.Column('pattern_tags',         ARRAY(sa.String), server_default='{}'),
-        sa.Column('embedding',            sa.Text, nullable=True),  # Vector handled by pgvector
+        sa.Column('embedding',            Vector(1536), nullable=True),
         sa.Column('training_mode',        sa.String(50), nullable=True),
         sa.Column('agent_age_at_capture', sa.Integer, server_default='0'),
         sa.Column('created_at',           sa.DateTime, server_default=sa.text('NOW()')),
@@ -246,7 +247,7 @@ def upgrade():
         sa.Column('source_memory_ids',        ARRAY(UUID(as_uuid=True)), server_default='{}'),
         sa.Column('pattern_type',             sa.String(50), nullable=False),
         sa.Column('abstraction_weight',       sa.Float, server_default='5.0'),
-        sa.Column('embedding',                sa.Text, nullable=True),
+        sa.Column('embedding',                Vector(1536), nullable=True),
         sa.Column('created_at',               sa.DateTime, server_default=sa.text('NOW()')),
     )
 
