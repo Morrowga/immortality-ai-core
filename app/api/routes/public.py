@@ -19,13 +19,14 @@ from app.db.session import get_db, AsyncSessionLocal
 from app.models.user import (
     AgentProfile, AgentLifecycle, AgentResponse,
     RelationshipProfile, RelationshipRole,
-    PersonalitySurvey,
+    PersonalitySurvey, NeoPackage,
 )
 from app.services.agent import generate_agent_response
 from app.services.retrieval import fetch_all_retrieval_data
 from app.services.survey import naturalize_response
 from app.services.conversation_memory import maybe_extract_conversation_memory
 from app.services.souls import check_balance, deduct, tokens_to_souls, COST_CHAT_EN
+from app.services.neo import match_query_to_packages, build_neo_prompt_block, build_redirect_response
 
 router  = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -84,6 +85,30 @@ async def _get_agent_by_slug(slug: str, db: AsyncSession) -> AgentProfile:
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found. Check the link.")
     return agent
+
+
+# ── Neo Mode helper ────────────────────────────────────────────────────────
+
+async def _get_installed_neo_packages(agent_id, db: AsyncSession) -> list[dict]:
+    result = await db.execute(
+        select(NeoPackage).where(
+            NeoPackage.agent_id == agent_id,
+            NeoPackage.is_active == True,
+        ).order_by(NeoPackage.slot_number)
+    )
+    packages = result.scalars().all()
+    return [
+        {
+            "package_key":         pkg.package_key,
+            "package_type":        pkg.package_type,
+            "title":               pkg.title,
+            "domain_tags":         pkg.domain_tags or [],
+            "custom_instructions": pkg.custom_instructions,
+            "neo_mode_disclaimer": pkg.neo_mode_disclaimer,
+            "slot_number":         pkg.slot_number,
+        }
+        for pkg in packages
+    ]
 
 
 # ── GET /public/{slug} ────────────────────────────────────────────────────
@@ -176,7 +201,7 @@ async def verify_passphrase(slug: str, data: VerifyRequest, db: AsyncSession = D
         "expires_in_hours": _TOKEN_EXPIRY_HOURS,
         "person_gender":    matched.gender,
         "person_age":       matched.age,
-        "can_chat":         can_chat, 
+        "can_chat":         can_chat,
     }
 
 
@@ -340,6 +365,32 @@ async def public_chat(
 
     total_tokens = 0
 
+    # ── Neo Mode ──────────────────────────────────────────────────────────
+    neo_block = None
+    installed_packages = await _get_installed_neo_packages(agent.id, db)
+
+    if installed_packages:
+        matched_package = match_query_to_packages(data.message, installed_packages)
+        if matched_package:
+            neo_block = build_neo_prompt_block(matched_package, agent.agent_name)
+        else:
+            redirect = await build_redirect_response(
+                question           = data.message,
+                installed_packages = installed_packages,
+                agent_name         = agent.agent_name,
+                language           = response_language,
+            )
+            return {
+                "response":       redirect,
+                "memories_used":  0,
+                "patterns_used":  0,
+                "response_id":    str(uuid.uuid4()),
+                "zone":           zone,
+                "speaker_name":   speaker_name,
+                "souls_deducted": 0,
+                "tokens_used":    0,
+            }
+
     # ── Layer 1: Sonnet ───────────────────────────────────────────────────
     draft, l1_tokens = await generate_agent_response(
         question             = data.message,
@@ -356,8 +407,9 @@ async def public_chat(
         relationship_profile = relationship_profile,
         conversation_history = conversation_history,
         language_samples     = language_samples,
-        known_people         = known_people, 
-        ambiguity            = ambiguity
+        known_people         = known_people,
+        ambiguity            = ambiguity,
+        neo_block            = neo_block,
     )
     total_tokens += l1_tokens
 
@@ -446,14 +498,14 @@ async def public_chat(
         )
 
     return {
-        "response":      response_text,
-        "memories_used": len(memories),
-        "patterns_used": len(patterns),
-        "response_id":   str(agent_response.id),
-        "zone":          zone,
-        "speaker_name":  speaker_name,
+        "response":       response_text,
+        "memories_used":  len(memories),
+        "patterns_used":  len(patterns),
+        "response_id":    str(agent_response.id),
+        "zone":           zone,
+        "speaker_name":   speaker_name,
         "souls_deducted": souls_cost,
-        "tokens_used":   total_tokens,
+        "tokens_used":    total_tokens,
     }
 
 
@@ -528,6 +580,7 @@ async def update_agent_slug(
         "public_url": f"/{agent.slug}",
         "message":    "Slug updated. Share this link with your people.",
     }
+
 
 @router.get("/{slug}/image")
 async def get_public_agent_image(slug: str, db: AsyncSession = Depends(get_db)):
