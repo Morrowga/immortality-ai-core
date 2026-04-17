@@ -67,8 +67,9 @@ async def generate_agent_response(
     relationship_profile: dict = None,
     conversation_history: list[dict] = [],
     language_samples: list[str] = [],
-    known_people: list[dict] = [], 
+    known_people: list[dict] = [],
     ambiguity: dict = None,
+    neo_block: str | None = None,           # ← NEW: Neo Mode injection
 ) -> tuple[str, int]:
     """
     Returns (response_text, tokens_used).
@@ -167,11 +168,43 @@ Communication style:
             "If someone is mentioned but not in this list — say you don't know who that is.\n"
         )
 
-        print(f"[KNOWN PEOPLE] {known_people}")        
-        print(f"[KNOWN PEOPLE BLOCK] {known_people_context[:200]}")  
+        print(f"[KNOWN PEOPLE] {known_people}")
+        print(f"[KNOWN PEOPLE BLOCK] {known_people_context[:200]}")
+
+    # ── Memory-only rule — relaxed when Neo Mode is active ─────────────────
+    if neo_block:
+        memory_only_rule = """
+CRITICAL — KNOWLEDGE SOURCES:
+You have TWO sources of knowledge for this response:
+  1. Your personal memories and facts below
+  2. Neo Mode expertise injected above your facts
+
+For questions covered by Neo Mode — answer from that expertise freely and fully.
+Speak in your own voice, your own style — but draw on the Neo knowledge without hesitation.
+Do NOT say "I don't know" or "I don't have memories about that" when Neo Mode covers the topic.
+
+For questions NOT covered by Neo Mode and NOT in your memories — admit you don't know.
+"""
+    else:
+        memory_only_rule = """
+CRITICAL — MEMORY-ONLY KNOWLEDGE:
+You are NOT a general AI assistant. You do NOT have general world knowledge.
+You only know what is in YOUR FACTS above.
+If the question is about something not mentioned in your facts — admit you don't know.
+Do NOT answer from general knowledge, training data, encyclopedia facts, or common sense.
+Do NOT pretend to know things just because any educated person would know them.
+
+Wrong: answering factual questions about animals, science, history, news, or any topic
+       not found in your memories — even if you "know" the answer as an AI.
+Right: "မသိဘူးလေ" / "I haven't really thought about that" / "ကျွန်တော် မသိဘူး"
+       — said naturally, in your own voice, without sounding robotic.
+
+The only exception: if Neo Mode knowledge is explicitly provided above your facts,
+you may use that knowledge to answer — but still speak in your own voice.
+"""
 
     # ── Answering rules (static) ────────────────────────────────────────────
-    answering_rules = """
+    answering_rules = f"""
 PERSON ACCURACY RULE — CRITICAL:
 Each memory fact belongs ONLY to the specific person named in that memory.
 NEVER apply a memory about one person to a different person.
@@ -215,20 +248,7 @@ If a memory exists → answer it. The relationship zone affects TONE, not WHETHE
 If there is no memory about something → say you don't know or haven't thought about that.
 Never invent facts not in your memories.
 
-CRITICAL — MEMORY-ONLY KNOWLEDGE:
-You are NOT a general AI assistant. You do NOT have general world knowledge.
-You only know what is written in YOUR FACTS above.
-If the question is about something not mentioned in your facts — admit you don't know.
-Do NOT answer from general knowledge, training data, encyclopedia facts, or common sense.
-Do NOT pretend to know things just because any educated person would know them.
-
-Wrong: answering factual questions about animals, science, history, news, or any topic
-       not found in your memories — even if you "know" the answer as an AI.
-Right: "မသိဘူးလေ" / "I haven't really thought about that" / "ကျွန်တော် မသိဘူး"
-       — said naturally, in your own voice, without sounding robotic.
-
-The only exception: if Neo Mode knowledge is explicitly provided above your facts,
-you may use that knowledge to answer — but still speak in your own voice.
+{memory_only_rule}
 
 ADDRESS FORM RULE — this is non-negotiable:
 If REQUIRED address forms are listed — use the primary form as default.
@@ -294,7 +314,7 @@ training memories below. Do not invent traits not shown in memories.
             extra = "  [core — never forget]"
         elif reinforced and reinforced > 1:
             extra = f"  [mentioned {reinforced + 1} times]"
-        
+
         time_note = ""
         if created_at:
             try:
@@ -388,7 +408,7 @@ FACT{extra}{time_note}:
             relationship_voice_block = (
                 f"\nYOUR VOICE WITH THIS PERSON — follow this exactly:\n{rel_voice}\n"
             )
-        
+
     # ── Ambiguity block ─────────────────────────────────────────────────────
     ambiguity_block = ""
     if ambiguity and ambiguity.get("ambiguous"):
@@ -402,6 +422,11 @@ Ask the speaker which one they mean — ONE short question, in your natural voic
 After they clarify → answer normally.
 """
 
+    # ── Neo Mode block (injected just before facts) ─────────────────────────
+    neo_section = ""
+    if neo_block:
+        neo_section = neo_block
+
     # ── User prompt (fully dynamic — never cached) ──────────────────────────
     user_prompt = f"""═══════════════════════════════════════
 {speaker_block}
@@ -409,6 +434,7 @@ After they clarify → answer normally.
 ═══════════════════════════════════════
 {ambiguity_block}
 {system_slang_block}
+{neo_section}
 YOUR FACTS — everything below is true about you:
 {memory_context}
 
@@ -420,6 +446,7 @@ Use comma, new line, or just continue the sentence naturally.
 {question}
 
 Look through your facts above. If any fact answers this, say it directly.
+If Neo Mode is active above, use that expertise to answer fully.
 Respond in your natural voice. Short, human, conversational.
 Match the rhythm and style of your real writing samples."""
 
@@ -437,6 +464,7 @@ Match the rhythm and style of your real writing samples."""
     print(f"[DEBUG HISTORY] count={len(conversation_history)}")
     for i, h in enumerate(conversation_history):
         print(f"  [{i}] {h['role']}: {h['content'][:60]}")
+    print(f"[DEBUG NEO] neo_block={'yes' if neo_block else 'no'}")
 
     # ── API call with retry ─────────────────────────────────────────────────
     last_error = None
@@ -444,7 +472,7 @@ Match the rhythm and style of your real writing samples."""
         try:
             response = await client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=1000,
+                max_tokens=2048,                    # ← FIXED: was 1000, caused cut-off
                 system=system_blocks,
                 messages=messages,
                 extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
