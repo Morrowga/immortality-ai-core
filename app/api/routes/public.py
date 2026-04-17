@@ -47,6 +47,7 @@ class PublicChatRequest(BaseModel):
     speaker_gender: Optional[str] = None
     speaker_age:    Optional[int] = None
     session_key:    Optional[str] = None
+    neo_mode:       Optional[bool] = False
 
 class SlugUpdateRequest(BaseModel):
     slug: str
@@ -367,7 +368,7 @@ async def public_chat(
 
     # ── Neo Mode ──────────────────────────────────────────────────────────
     neo_block = None
-    installed_packages = await _get_installed_neo_packages(agent.id, db)
+    installed_packages = await _get_installed_neo_packages(agent.id, db) if data.neo_mode else []
 
     if installed_packages:
         matched_package = match_query_to_packages(data.message, installed_packages)
