@@ -43,7 +43,9 @@ MIN_CUSTOM_PACKAGE_CHARS = 300
 MAX_PACKAGES = 4
 
 # Query relevance threshold — looser than memory search (domain matching is broader)
-RELEVANCE_THRESHOLD = 0.35
+# Set to 1 so a single tag word match is enough — gaming questions often use
+# game-specific nouns (hero names, game titles) not literally in DOMAIN_TAGS
+RELEVANCE_THRESHOLD = 1
 
 
 # ── Shared Haiku caller ───────────────────────────────────────────────────
@@ -79,15 +81,6 @@ async def validate_custom_instructions(
     domain_tags: list[str],
     custom_instructions: str,
 ) -> dict:
-    """
-    Check that the owner's custom instructions belong to the package's domain.
-
-    Returns:
-      {"valid": True}
-      {"valid": False, "reason": "..."}
-
-    Called before saving custom instructions on a system package.
-    """
     if not custom_instructions or not custom_instructions.strip():
         return {"valid": True}
 
@@ -122,7 +115,6 @@ async def validate_custom_instructions(
             raw = raw.split("```")[1].lstrip("json").strip()
         return json.loads(raw)
     except Exception:
-        # Parse failure — allow it rather than block the owner
         return {"valid": True}
 
 
@@ -132,16 +124,6 @@ async def validate_custom_package(
     title: str,
     content: str,
 ) -> dict:
-    """
-    Check that custom package content is:
-    - Genuine knowledge (not random text or harmful instructions)
-    - Within reasonable length
-    - Coherent enough to be useful
-
-    Returns:
-      {"valid": True, "domain_summary": "..."}
-      {"valid": False, "reason": "..."}
-    """
     if not content or not content.strip():
         return {"valid": False, "reason": "Content cannot be empty."}
 
@@ -190,10 +172,6 @@ async def validate_custom_package(
 # ── 3. Extract domain tags from custom package ────────────────────────────
 
 async def extract_domain_tags(title: str, content: str) -> list[str]:
-    """
-    Extract 10–20 domain tags from custom package content.
-    Used for query-time relevance matching.
-    """
     raw = await _call_haiku(
         system="Extract domain tags. Return ONLY a JSON array of strings. No markdown.",
         user=(
@@ -212,7 +190,6 @@ async def extract_domain_tags(title: str, content: str) -> list[str]:
         tags = json.loads(raw)
         return [t for t in tags if isinstance(t, str)][:20]
     except Exception:
-        # Fallback — split title into tags
         return title.lower().split()
 
 
@@ -225,15 +202,12 @@ def match_query_to_packages(
     """
     Find which installed package best matches a query using keyword overlap.
 
-    Simple keyword matching against domain_tags — fast, no embedding needed.
-    Embedding search would add latency; keyword match is good enough here
-    because domain_tags are already broad topic words.
+    Threshold is intentionally low (score >= 1) because users ask about
+    specific games, heroes, or titles that won't literally appear in DOMAIN_TAGS.
+    A single tag word match ("game", "play", "strategy", etc.) is enough
+    to route to the right package rather than redirect.
 
-    Returns the best matching package dict or None if no match.
-
-    installed_packages: list of dicts from DB rows, each with:
-      {package_key, package_type, title, domain_tags, custom_instructions,
-       neo_mode_disclaimer, slot_number}
+    Returns the best matching package dict or None if no match at all.
     """
     if not installed_packages:
         return None
@@ -250,7 +224,7 @@ def match_query_to_packages(
 
         for tag in domain_tags:
             tag_lower = tag.lower()
-            # Exact tag in query
+            # Exact tag phrase found in query
             if tag_lower in query_lower:
                 score += 3
             # Tag words overlap with query words
@@ -262,9 +236,9 @@ def match_query_to_packages(
             best_score = score
             best_match = pkg
 
-    # Minimum score threshold — at least 2 points to count as a match
-    # Prevents very generic queries from matching unrelated packages
-    if best_score < 2:
+    # Score >= 1: even one overlapping word is enough to match.
+    # Only redirect when the query shares zero words with any package domain.
+    if best_score < 1:
         return None
 
     return best_match
@@ -278,14 +252,11 @@ def build_neo_prompt_block(
 ) -> str:
     """
     Format the Neo knowledge injection for agent.py Layer 1 user prompt.
-
-    Injected as a clearly labeled block, separate from personal memories.
-    The agent uses this knowledge but speaks in their own voice.
     """
-    pkg_type  = matched_package.get("package_type", "system")
-    pkg_key   = matched_package.get("package_key")
-    title     = matched_package.get("title", "Knowledge")
-    custom    = (matched_package.get("custom_instructions") or "").strip()
+    pkg_type   = matched_package.get("package_type", "system")
+    pkg_key    = matched_package.get("package_key")
+    title      = matched_package.get("title", "Knowledge")
+    custom     = (matched_package.get("custom_instructions") or "").strip()
     disclaimer = matched_package.get("neo_mode_disclaimer") or ""
 
     lines = [f"\n{'═' * 40}"]
@@ -314,24 +285,21 @@ def build_neo_prompt_block(
 
     return "\n".join(lines)
 
+
+# ── 6. Validate and generate custom package ───────────────────────────────
+
 async def validate_and_generate_package(title: str) -> dict:
     """
     Validate the title is meaningful, then generate full package content.
- 
-    Returns:
-      {"valid": True, "content": "...", "domain_summary": "..."}
-      {"valid": False, "reason": "..."}
- 
-    Called from POST /api/neo/packages/custom/generate
     """
     if not title or not title.strip():
         return {"valid": False, "reason": "Title cannot be empty."}
- 
+
     title = title.strip()
- 
+
     if len(title) < 3:
         return {"valid": False, "reason": "Title is too short. Be more specific."}
- 
+
     raw = await _call_haiku(
         system=(
             "You are a knowledge package generator for a personal AI agent. "
@@ -359,7 +327,7 @@ async def validate_and_generate_package(title: str) -> dict:
         ),
         max_tokens=1200,
     )
- 
+
     try:
         if raw.startswith("```"):
             raw = raw.split("```")[1].lstrip("json").strip()
@@ -367,7 +335,8 @@ async def validate_and_generate_package(title: str) -> dict:
     except Exception:
         return {"valid": False, "reason": "Could not process the title. Try being more specific."}
 
-# ── 6. Build redirect response ────────────────────────────────────────────
+
+# ── 7. Build redirect response ────────────────────────────────────────────
 
 async def build_redirect_response(
     question: str,
@@ -379,25 +348,11 @@ async def build_redirect_response(
     """
     When Neo Mode is on but query doesn't match any installed package,
     respond in the agent's voice redirecting to what they CAN help with.
-
-    Uses Haiku — short call, just needs to sound like the agent.
+    Kept short — 1 to 2 sentences max.
     """
     package_titles = [pkg.get("title", "") for pkg in installed_packages]
-
-    # Collect example topics across all installed packages
-    all_topics: list[str] = []
-    for pkg in installed_packages:
-        pkg_key = pkg.get("package_key")
-        if pkg_key:
-            all_topics.extend(get_example_topics(pkg_key)[:3])
-        elif pkg.get("package_type") == "custom":
-            domain_tags = pkg.get("domain_tags") or []
-            all_topics.extend(domain_tags[:3])
-
-    topics_str = ", ".join(all_topics[:6]) if all_topics else "the areas I know well"
     packages_str = " and ".join(package_titles) if package_titles else "my trained areas"
 
-    # Voice fingerprint hint
     style_hint = ""
     if voice_fingerprint and voice_fingerprint.get("sample_count", 0) >= 2:
         rhythm = voice_fingerprint.get("sentence_rhythm", "")
@@ -415,14 +370,14 @@ async def build_redirect_response(
         ),
         user=(
             f"Someone asked: \"{question}\"\n\n"
-            f"You have Neo Mode expertise in: {packages_str}\n"
+            f"Your Neo Mode expertise covers: {packages_str}\n"
             f"Their question is outside your Neo Mode training.\n\n"
-            f"Respond briefly — say you haven't trained for that specific area, "
-            f"mention what you CAN help with from: {topics_str}\n"
-            f"2-3 sentences max. Sound like yourself, not a robot.\n"
-            f"Do NOT say 'I am an AI'. Do NOT be formal unless that's your natural style."
+            f"Reply in 1-2 sentences only. Say you haven't trained for that specific area "
+            f"and briefly mention what you CAN help with.\n"
+            f"Do NOT list topics. Do NOT use bullet points. Do NOT be formal unless that's your natural style.\n"
+            f"Do NOT say 'I am an AI'."
         ),
-        max_tokens=200,
+        max_tokens=80,
     )
 
     return raw
