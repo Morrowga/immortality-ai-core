@@ -200,18 +200,18 @@ def match_query_to_packages(
     installed_packages: list[dict],
 ) -> dict | None:
     """
-    Find which installed package best matches a query using keyword overlap.
-
-    Threshold is intentionally low (score >= 1) because users ask about
-    specific games, heroes, or titles that won't literally appear in DOMAIN_TAGS.
-    A single tag word match ("game", "play", "strategy", etc.) is enough
-    to route to the right package rather than redirect.
-
-    Returns the best matching package dict or None if no match at all.
+    Single package installed -> always return it.
+    Multiple packages -> keyword overlap scoring, best match wins if score >= 1.
     """
     if not installed_packages:
         return None
 
+    # Single package — always route to it regardless of query language or content.
+    # Owner installed it, so all questions go through it.
+    if len(installed_packages) == 1:
+        return installed_packages[0]
+
+    # Multiple packages — score and pick best.
     query_lower = query.lower()
     query_words = set(query_lower.split())
 
@@ -224,10 +224,8 @@ def match_query_to_packages(
 
         for tag in domain_tags:
             tag_lower = tag.lower()
-            # Exact tag phrase found in query
             if tag_lower in query_lower:
                 score += 3
-            # Tag words overlap with query words
             tag_words = set(tag_lower.split())
             overlap = tag_words & query_words
             score += len(overlap)
@@ -236,8 +234,6 @@ def match_query_to_packages(
             best_score = score
             best_match = pkg
 
-    # Score >= 1: even one overlapping word is enough to match.
-    # Only redirect when the query shares zero words with any package domain.
     if best_score < 1:
         return None
 
